@@ -1,92 +1,98 @@
+import os
+import logging
+from typing import Dict, Any
 import torchaudio.transforms as T
 import torch
-from datasets import load_dataset
-from transformers import Tacotron2Processor, Tacotron2ForConditionalGeneration
-from torch.utils.data import DataLoader
+from datasets import load_dataset, Dataset
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants
+SAMPLE_RATE = 22050
+N_MELS = 80
+HOP_LENGTH = 256
+WIN_LENGTH = 1024
+N_FFT = 1024
+MAX_WAV_VALUE = 32768.0
 
 # Load the LJSpeech dataset
-dataset = load_dataset("lj_speech")
+def load_lj_speech() -> Dataset:
+    try:
+        return load_dataset("lj_speech", split="train")
+    except Exception as e:
+        logging.error(f"Failed to load LJSpeech dataset: {e}")
+        raise
 
-# Function to preprocess text (simple lowercasing for this example)
-def preprocess_text(text):
+# Function to preprocess text
+def preprocess_text(text: str) -> str:
     return text.lower()
 
 # Function to preprocess audio
-def preprocess_audio(audio):
-    waveform = torch.tensor(audio["array"])
-    sample_rate = audio["sampling_rate"]
-    transform = T.MelSpectrogram(sample_rate=sample_rate, n_mels=80)
+def preprocess_audio(audio: Dict[str, Any]) -> torch.Tensor:
+    waveform = torch.tensor(audio["array"], dtype=torch.float32)
+    waveform = waveform / MAX_WAV_VALUE
+
+    transform = T.MelSpectrogram(
+        sample_rate=SAMPLE_RATE,
+        n_mels=N_MELS,
+        hop_length=HOP_LENGTH,
+        win_length=WIN_LENGTH,
+        n_fft=N_FFT,
+        center=False
+    )
+
     mel_spec = transform(waveform)
+    mel_spec = torch.log(torch.clamp(mel_spec, min=1e-5))
     return mel_spec
 
+# Apply preprocessing to a single item
+def preprocess_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        item["text"] = preprocess_text(item["text"])
+        item["mel_spectrogram"] = preprocess_audio(item["audio"])
+        return item
+    except Exception as e:
+        logging.warning(f"Failed to preprocess item: {e}")
+        return None
+
 # Apply preprocessing to the dataset
-def preprocess_batch(batch):
-    batch["text"] = preprocess_text(batch["text"])
-    batch["mel_spectrogram"] = preprocess_audio(batch["audio"])
-    return batch
+def preprocess_dataset(dataset: Dataset, num_proc: int = 4) -> Dataset:
+    with ProcessPoolExecutor(max_workers=num_proc) as executor:
+        futures = [executor.submit(preprocess_item, item) for item in dataset]
 
-# Apply the preprocessing to the dataset
-dataset = dataset.map(preprocess_batch, remove_columns=["audio", "file"])
+        preprocessed_data = []
+        for future in tqdm(as_completed(futures), total=len(dataset), desc="Preprocessing"):
+            result = future.result()
+            if result is not None:
+                preprocessed_data.append(result)
 
-# Load the Tacotron 2 model and processor
-processor = Tacotron2Processor.from_pretrained("facebook/tacotron2")
-model = Tacotron2ForConditionalGeneration.from_pretrained("facebook/tacotron2")
+    return Dataset.from_dict({
+        key: [item[key] for item in preprocessed_data]
+        for key in preprocessed_data[0].keys()
+        if key not in ["audio", "file"]
+    })
 
-# Prepare DataLoader
-def collate_fn(batch):
-    input_ids = [processor(text=item["text"], return_tensors="pt").input_ids.squeeze(0) for item in batch]
-    labels = [item["mel_spectrogram"] for item in batch]
-    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=processor.pad_token_id)
-    labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=0.0)
-    return {"input_ids": input_ids, "labels": labels}
+def main():
+    output_path = "path_to_preprocessed_dataset"
 
-dataloader = DataLoader(dataset["train"], batch_size=8, collate_fn=collate_fn)
+    try:
+        # Load dataset
+        dataset = load_lj_speech()
+        logging.info(f"Loaded dataset with {len(dataset)} items")
 
-# Training loop
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        # Preprocess dataset
+        preprocessed_dataset = preprocess_dataset(dataset)
+        logging.info(f"Preprocessed dataset with {len(preprocessed_dataset)} items")
 
-model.train()
-for epoch in range(10):  # Train for 10 epochs
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(model.device)
-        labels = batch["labels"].to(model.device)
-        
-        outputs = model(input_ids=input_ids, labels=labels)
-        loss = outputs.loss
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-    print(f"Epoch {epoch + 1}, Loss: {loss.item()}")
+        # Save the preprocessed dataset
+        preprocessed_dataset.save_to_disk(output_path)
+        logging.info(f"Dataset preprocessed and saved to {output_path}")
 
-# Synthesis (Text to Speech)
-model.eval()
+    except Exception as e:
+        logging.error(f"An error occurred during preprocessing: {e}")
 
-# Example text input
-text = "Hello, how are you?"
-
-# Preprocess the text input
-input_ids = processor(text=text, return_tensors="pt").input_ids.to(model.device)
-
-# Generate mel spectrogram
-with torch.no_grad():
-    outputs = model.generate(input_ids=input_ids)
-
-mel_spectrogram = outputs
-
-# Convert mel spectrogram to audio waveform (requires vocoder, e.g., WaveGlow)
-# Load or define a vocoder model
-# You need to load a pretrained vocoder model for the conversion. Here is an example using WaveGlow:
-from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-
-# Assuming WaveGlow vocoder is already trained and available
-vocoder = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")
-processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-
-# Convert mel spectrogram to waveform
-waveform = vocoder(mel_spectrogram)
-
-# Save or play the waveform as needed
-import soundfile as sf
-sf.write('output.wav', waveform.cpu().numpy(), 22050)
+if __name__ == "__main__":
+    main()
